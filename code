@@ -1,0 +1,462 @@
+import os
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+import matplotlib.pyplot as plt
+
+DATA_DIR   = "/Users/danko/Desktop/25 Spring/QBIO465/OASIS-1/Data"           # your “big” folder
+IMG_SIZE   = (128, 128)
+BATCH_SIZE = 32
+EPOCHS     = 30
+SEED       = 42
+
+# You can also explicitly pass `class_names=` in the order you like;
+# otherwise it will sort them alphabetically.
+CLASS_NAMES = [
+    "Non Demented",
+    "Very mild Dementia",
+    "Mild Dementia",
+    "Moderate Dementia",
+]
+
+train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    DATA_DIR,
+    validation_split=0.2,
+    subset="training",
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="int"           # integer labels 0–3
+)
+val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    DATA_DIR,
+    validation_split=0.2,
+    subset="validation",
+    seed=SEED,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    label_mode="int"
+)
+
+print("Classes and their numeric labels:", train_ds.class_names)
+
+model = models.Sequential([
+    layers.Rescaling(1./255, input_shape=IMG_SIZE + (3,)),
+    layers.Conv2D(32, 3, activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Conv2D(64, 3, activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Conv2D(128, 3, activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Flatten(),
+    layers.Dense(128, activation="relu"),
+    layers.Dropout(0.5),
+    layers.Dense(len(train_ds.class_names), activation="softmax")
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-4),
+    loss="sparse_categorical_crossentropy",  # for integer labels
+    metrics=["accuracy"]                     # dropped AUC to avoid the segment_sum bug
+)
+model.summary()
+
+cb_early = callbacks.EarlyStopping(
+    monitor="val_loss", patience=3, restore_best_weights=True
+)
+cb_ckpt = callbacks.ModelCheckpoint(
+    "best_model.keras", monitor="val_loss", save_best_only=True
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[cb_early, cb_ckpt]
+)
+
+loss, accuracy = model.evaluate(val_ds, verbose=1)
+print(f"\nValidation loss: {loss:.4f}   accuracy: {accuracy:.4f}")
+
+acc      = history.history["accuracy"]
+val_acc  = history.history["val_accuracy"]
+losses   = history.history["loss"]
+val_loss = history.history["val_loss"]
+epochs_range = range(1, len(acc)+1)
+
+plt.figure(figsize=(12,5))
+
+plt.subplot(1,2,1)
+plt.plot(epochs_range, acc,    label="Train Acc")
+plt.plot(epochs_range, val_acc, label="Val   Acc")
+plt.title("Accuracy")
+plt.xlabel("Epoch")
+plt.legend()
+plt.grid()
+
+plt.subplot(1,2,2)
+plt.plot(epochs_range, losses,   label="Train Loss")
+plt.plot(epochs_range, val_loss, label="Val   Loss")
+plt.title("Loss")
+plt.xlabel("Epoch")
+plt.legend()
+plt.grid()
+
+plt.tight_layout()
+plt.show()
+
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers, Model, callbacks, Input
+from sklearn.metrics import roc_curve, auc
+
+# ─── 0. Hyperparameters & Dataset Paths ──────────────────────────
+DATA_DIR    = "/Users/danko/Desktop/25 Spring/QBIO465/OASIS-1/Data"
+IMG_SIZE    = (128, 128)
+BATCH_SIZE  = 32
+EPOCHS      = 15
+SEED        = 42
+
+# ─── 1. Build tf.data Pipelines ─────────────────────────────────
+def make_datasets(data_dir, img_size, batch_size, seed):
+    """Load directory dataset and apply caching/prefetching."""
+    raw_train = tf.keras.preprocessing.image_dataset_from_directory(
+        data_dir,
+        validation_split=0.2,
+        subset="training",
+        seed=seed,
+        image_size=img_size,
+        batch_size=batch_size,
+        label_mode="int"
+    )
+    raw_val = tf.keras.preprocessing.image_dataset_from_directory(
+        data_dir,
+        validation_split=0.2,
+        subset="validation",
+        seed=seed,
+        image_size=img_size,
+        batch_size=batch_size,
+        label_mode="int"
+    )
+    return raw_train, raw_val
+
+# light augmentation only on training
+augmentation = tf.keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+], name="augmentation")
+
+def preprocess(ds, train=False):
+    """Apply augmentation if train, then cache & prefetch."""
+    if train:
+        ds = ds.map(lambda x,y: (augmentation(x, training=True), y),
+                    num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.cache().prefetch(tf.data.AUTOTUNE)
+
+raw_train, raw_val = make_datasets(DATA_DIR, IMG_SIZE, BATCH_SIZE, SEED)
+train_ds = preprocess(raw_train, train=True)
+val_ds   = preprocess(raw_val,   train=False)
+
+CLASS_NAMES = raw_train.class_names
+print("Class names:", CLASS_NAMES)
+
+# ─── 2. Build & Compile Model ────────────────────────────────────
+inp = Input(shape=(*IMG_SIZE,3), name="input_image")
+x   = layers.Rescaling(1./255)(inp)
+
+# four conv blocks
+for filters in [32, 64, 128, 256]:
+    x = layers.Conv2D(filters, 3, padding="same", activation=None)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPool2D()(x)
+
+# save penultimate activation for higher‐resolution CAM
+penult = x
+
+# final conv block for CAM
+x = layers.Conv2D(512, 3, padding="same", activation=None, name="cam_conv")(x)
+x = layers.BatchNormalization()(x)
+x = layers.Activation("relu")(x)
+x = layers.MaxPool2D()(x)
+
+x = layers.Flatten()(x)
+x = layers.Dense(128, activation="relu")(x)
+x = layers.Dropout(0.5)(x)
+out = layers.Dense(len(CLASS_NAMES), activation="softmax", name="predictions")(x)
+
+model = Model(inp, out, name="DeepCNN_for_CAM")
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-4),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+model.summary()
+
+# ─── 3. Train with Callbacks ─────────────────────────────────────
+cbs = [
+    callbacks.ReduceLROnPlateau("val_loss", factor=0.5, patience=2, min_lr=1e-6),
+    callbacks.EarlyStopping(   "val_loss", patience=5, restore_best_weights=True),
+    callbacks.ModelCheckpoint("best_cam_model.keras", "val_loss", save_best_only=True),
+]
+history = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS)#callbacks=cbs
+
+# ─── 4. Plot Training Curves & ROC ───────────────────────────────
+# a) loss & accuracy
+plt.figure(figsize=(14,4))
+plt.subplot(1,2,1)
+plt.plot(history.history["loss"],    label="Train Loss")
+plt.plot(history.history["val_loss"],label="Val   Loss")
+plt.title("Training vs. Validation Loss")
+plt.xlabel("Epoch"); plt.legend(); plt.grid()
+
+plt.subplot(1,2,2)
+plt.plot(history.history["accuracy"],    label="Train Acc")
+plt.plot(history.history["val_accuracy"],label="Val   Acc")
+plt.title("Training vs. Validation Accuracy")
+plt.xlabel("Epoch"); plt.legend(); plt.grid()
+plt.show()
+
+CLASS_NAMES = raw_train.class_names
+print("Class names:", CLASS_NAMES)
+
+# b) ROC curve on validation set
+y_true = np.concatenate([y.numpy() for _,y in val_ds], axis=0)
+y_prob = np.concatenate([model.predict(x) for x,_ in val_ds], axis=0)
+# compute micro-average ROC (multi-class)
+fpr = dict(); tpr = dict()
+roc_auc = dict()
+for i in range(len(CLASS_NAMES)):
+    fpr[i], tpr[i], _ = roc_curve((y_true==i).astype(int), y_prob[:,i])
+    roc_auc[i] = auc(fpr[i], tpr[i])
+plt.figure()
+for i,name in enumerate(CLASS_NAMES):
+    plt.plot(fpr[i], tpr[i], label=f"{name} (AUC={roc_auc[i]:.2f})")
+plt.plot([0,1],[0,1], 'k--')
+plt.title("ROC Curves (Validation)")
+plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+plt.legend(); plt.grid(); plt.show()
+
+# ─── 5. Build Grad‐CAM Submodel ─────────────────────────────────
+grad_model = Model(
+    inputs  = model.inputs,
+    outputs = [penult, model.get_layer("cam_conv").output, model.output]
+)
+
+def compute_gradcam(img_tensor, grad_model, layer_idx=-1, class_idx=None):
+    """
+    Returns normalized CAM of shape (Hf, Wf) in [0,1].
+    layer_idx=-2 uses penultimate block; -1 uses final conv.
+    """
+    with tf.GradientTape() as tape:
+        feat_pen, feat_last, preds = grad_model(img_tensor)
+        conv_feats = [feat_pen, feat_last][layer_idx==-1]
+        if class_idx is None:
+            class_idx = tf.argmax(preds[0])
+        loss = preds[:, class_idx]
+    grads   = tape.gradient(loss, conv_feats)
+    weights = tf.reduce_mean(grads, axis=(0,1,2))
+    feat    = conv_feats[0]
+    cam     = tf.reduce_sum(feat * weights, axis=-1)
+    cam     = tf.nn.relu(cam)
+    cam    /= (tf.reduce_max(cam) + 1e-8)
+    return cam.numpy()
+
+# ─── 6. Brain‐Masking & ROI Extraction ──────────────────────────
+def brain_mask(gray):
+    """Otsu threshold + morphological opening to remove skull."""
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
+    mask    = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    return mask
+
+def overlay_and_rois(gray, cam, topk=3, top_perc=0.05):
+    """
+    Upsample cam, apply brain mask, colorize, overlay, and extract topk ROIs.
+    """
+    H,W = gray.shape
+    # upsample + smooth
+    cam_up = cv2.resize(cam.astype(np.float32),(W,H),cv2.INTER_LINEAR)
+    cam_up = cv2.GaussianBlur(cam_up,(7,7),0)
+    # mask out non-brain
+    mask   = brain_mask(gray)
+    cam_up *= (mask>0).astype(np.float32)
+    # color map & overlay
+    heatc   = cv2.applyColorMap((cam_up*255).astype(np.uint8), cv2.COLORMAP_JET)
+    base    = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    overlay = cv2.addWeighted(heatc, 0.4, base, 0.6, 0)
+    # threshold top x%
+    flat = cam_up.flatten()
+    k    = max(1, int(len(flat)*top_perc))
+    thr  = np.sort(flat)[-k]
+    bw   = (cam_up >= thr).astype(np.uint8)*255
+    cnts,_ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts   = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)[:topk]
+    rois=[]
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        rois.append((x,y,w,h))
+        cv2.rectangle(overlay, (x,y),(x+w,y+h), (0,255,0), 2)
+    return overlay, rois, cam_up
+
+# ─── 7. Visualize on one Validation Sample ──────────────────────
+for batch_x, batch_y in val_ds.take(1):
+    img = batch_x[0].numpy().astype("uint8")
+    gt  = int(batch_y[0].numpy())
+    break
+
+inp_tensor = img[None]/255.0
+preds      = model.predict(inp_tensor)
+plabel     = int(tf.argmax(preds[0]))
+
+# compute CAM from penultimate conv block
+cam       = compute_gradcam(inp_tensor, grad_model, layer_idx=-2, class_idx=plabel)
+gray      = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+overlay, rois, cam_up = overlay_and_rois(gray, cam, topk=3, top_perc=0.03)
+
+inp_tensor_new = img[None]
+preds_new     = model.predict(inp_tensor_new)
+plabel_new    = int(tf.argmax(preds_new[0]))
+
+# final plotting
+plt.figure(figsize=(12,4))
+plt.subplot(1,3,1)
+plt.imshow(gray, cmap="gray")
+plt.title(f"Ground Truth: {CLASS_NAMES[gt]}\nPrediction: {CLASS_NAMES[plabel_new]}")
+plt.axis("off")
+
+plt.subplot(1,3,2)
+plt.imshow(cam_up, cmap="jet")
+plt.title("Masked Grad-CAM (penultimate)")
+plt.axis("off")
+
+plt.subplot(1,3,3)
+plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+plt.title(f"Detected ROIs: {rois}")
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import Model
+
+CLASS_NAMES = raw_train.class_names
+print("Class names:", CLASS_NAMES)
+
+# ─── A. Build Grad-CAM submodel ─────────────────────────────────
+# Extract the penultimate activation and the final conv layer output
+grad_model = Model(
+    inputs  = model.inputs,
+    outputs = [penult, model.get_layer("cam_conv").output, model.output]
+)
+
+# ─── B. Grad-CAM computation ─────────────────────────────────────
+def compute_gradcam(img_tensor, grad_model, layer_idx=-1, class_idx=None):
+    """
+    Compute Grad-CAM heatmap for one image.
+      img_tensor: np.array shape (1,H,W,3), values in [0,1]
+      layer_idx: -2 -> penult conv, -1 -> final conv
+      class_idx: target class index (defaults to predicted class)
+    Returns:
+      cam: 2D float32 array (Hf,Wf), normalized to [0,1]
+    """
+    with tf.GradientTape() as tape:
+        feat_pen, feat_last, preds = grad_model(img_tensor)
+        conv_feats = feat_last if layer_idx==-1 else feat_pen
+        if class_idx is None:
+            class_idx = tf.argmax(preds[0])
+        loss = preds[:, class_idx]
+    grads   = tape.gradient(loss, conv_feats)
+    weights = tf.reduce_mean(grads, axis=(0,1,2))
+    feat    = conv_feats[0]
+    cam     = tf.reduce_sum(feat * weights, axis=-1)
+    cam     = tf.nn.relu(cam)
+    cam    /= (tf.reduce_max(cam) + 1e-8)
+    return cam.numpy()
+
+# ─── C. Brain-masking & ROI extraction ──────────────────────────
+def brain_mask(gray):
+    """Otsu threshold + morphological opening to remove skull."""
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+
+def overlay_and_rois(gray, cam, topk=3, top_perc=0.05):
+    """
+    Upsample cam, apply brain mask, overlay heatmap, extract topk ROIs.
+      gray:  uint8 H×W
+      cam:   float32 Hf×Wf in [0,1]
+    Returns:
+      overlay: uint8 H×W×3
+      rois:    list of (x,y,w,h)
+      cam_up:  float32 H×W
+    """
+    H,W    = gray.shape
+    cam_up = cv2.resize(cam, (W,H), interpolation=cv2.INTER_LINEAR)
+    cam_up = cv2.GaussianBlur(cam_up, (7,7), 0)
+    mask   = brain_mask(gray)
+    cam_up *= (mask>0).astype(np.float32)
+    heatc   = cv2.applyColorMap((cam_up*255).astype(np.uint8), cv2.COLORMAP_JET)
+    base    = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    overlay = cv2.addWeighted(heatc, 0.4, base, 0.6, 0)
+    flat = cam_up.flatten()
+    k    = max(1, int(len(flat)*top_perc))
+    thr  = np.sort(flat)[-k]
+    bw   = (cam_up >= thr).astype(np.uint8)*255
+    cnts,_ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts   = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)[:topk]
+    rois=[]
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        rois.append((x,y,w,h))
+        cv2.rectangle(overlay, (x,y),(x+w,y+h), (0,255,0), 2)
+    return overlay, rois, cam_up
+
+# ─── D. Random sampling + Visualization ─────────────────────────
+num_samples = 20
+# unbatch->shuffle->batch(1) to get random single-image batches
+random_ds = val_ds.unbatch().shuffle(buffer_size=1000, seed=SEED).batch(1)
+
+fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
+
+for i, (imgs, labels) in enumerate(random_ds.take(num_samples)):
+    # prepare data
+    img        = imgs[0].numpy().astype("uint8")      # RGB H×W×3
+    gray       = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) 
+    true_label = int(labels[0].numpy())
+    inp_tensor = img[None].astype("float32") / 255.0
+    preds      = model.predict(inp_tensor, verbose=0)
+    pred_label = int(tf.argmax(preds[0]))
+    # compute Grad-CAM on penultimate conv
+    cam        = compute_gradcam(inp_tensor, grad_model, layer_idx=-2, class_idx=pred_label)
+    overlay, rois, cam_up = overlay_and_rois(gray, cam, topk=3, top_perc=0.03)
+
+    row_axes = axes[i] if num_samples>1 else axes
+    # original gray
+    tensor_new = img[None].astype("float32")
+    preds_new      = model.predict(tensor_new, verbose=0)
+    pred_label_new = int(tf.argmax(preds_new[0]))
+    
+    ax = row_axes[0]
+    ax.imshow(gray, cmap="gray")
+    ax.set_title(f"GT: {CLASS_NAMES[true_label]}\nPred: {CLASS_NAMES[pred_label_new]}")
+    ax.axis("off")
+    # masked Grad-CAM
+    ax = row_axes[1]
+    ax.imshow(cam_up, cmap="jet")
+    ax.set_title("Masked Grad-CAM\n(penultimate)")
+    ax.axis("off")
+    # ROI overlay
+    ax = row_axes[2]
+    ax.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+    ax.set_title(f"ROIs: {rois}")
+    ax.axis("off")
+
+plt.tight_layout()
+plt.show()
